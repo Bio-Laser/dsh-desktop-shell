@@ -1,0 +1,3 @@
+# dotnet build outputs and WebView2 runtime caches (EBWebView etc.) — never git.
+bin/
+obj/
