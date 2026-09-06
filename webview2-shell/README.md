@@ -1,6 +1,8 @@
 # dsh-web WebView2 shell
 
-This Windows desktop host gives the Web GUI its own process and taskbar identity. It loads the URL passed as its first argument, defaulting to `http://127.0.0.1:3080`; when that URL is not ready, it starts the checkout's `apps/cli/lib/bin.js web --no-open`, waits for readiness, and stops only that child process when the window closes.
+This Windows desktop host gives the Web GUI its own process and taskbar identity. It loads the URL passed as its first argument, defaulting to `http://127.0.0.1:3080`; when no server answers on that URL, it starts the checkout's `apps/cli/lib/bin.js web --no-open`, waits for readiness, and stops only that child process when the window closes.
+
+Readiness means any HTTP response on the URL, including the bearer-token fence's 401 — the response alone proves the server is up. When the shell spawns the server, it navigates to the authenticated URL parsed from the server's `dsh web: <url>` stdout banner, because unauthenticated requests never pass the fence. A server that was already running keeps the configured URL (its stdout is not ours to read); pass the tokenized URL as the first argument in that case.
 
 Build on Windows with the .NET 8 SDK:
 

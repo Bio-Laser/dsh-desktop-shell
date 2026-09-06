@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -52,7 +54,11 @@ internal sealed class ShellForm : Form
             webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
             webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
             webView.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
-            webView.Source = new Uri(url);
+            // The spawned server prints its authenticated URL (bearer-token
+            // fence); navigate there so the GUI actually loads. The configured
+            // URL remains the fallback for an attached server whose stdout we
+            // do not own.
+            webView.Source = new Uri(server.NavigateUrl ?? url);
         }
         catch (Exception error)
         {
@@ -76,16 +82,21 @@ internal sealed class ShellForm : Form
 internal sealed class ServerLease : IDisposable
 {
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(2) };
+
     private readonly Process? process;
 
-    private ServerLease(Process? process)
+    private ServerLease(Process? process, string? navigateUrl)
     {
         this.process = process;
+        NavigateUrl = navigateUrl;
     }
+
+    /// <summary>Authenticated URL printed by the spawned server, when known.</summary>
+    public string? NavigateUrl { get; }
 
     public static async Task<ServerLease> StartAsync(Uri url)
     {
-        if (await IsReadyAsync(url)) return new ServerLease(null);
+        if (await IsReadyAsync(url)) return new ServerLease(null, null);
 
         var bin = FindDshBin();
         var process = Process.Start(new ProcessStartInfo
@@ -94,8 +105,26 @@ internal sealed class ServerLease : IDisposable
             Arguments = $"{Quote(bin)} web --no-open",
             UseShellExecute = false,
             CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
             WorkingDirectory = Path.GetDirectoryName(bin)!,
         }) ?? throw new InvalidOperationException("Could not start the dsh Node process.");
+
+        // The server answers 401 until a request carries its bearer token, so
+        // the authenticated URL comes from its stdout banner (`dsh web: <url>`),
+        // not from a status code.
+        var navigateUrl = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        process.OutputDataReceived += (_, line) =>
+        {
+            if (line.Data is null) return;
+            var match = Regex.Match(line.Data, @"^dsh web: (\S+)");
+            if (match.Success) navigateUrl.TrySetResult(match.Groups[1].Value);
+        };
+        process.ErrorDataReceived += (_, line) => Debug.WriteLineIf(line.Data is not null, line.Data);
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
 
         try
         {
@@ -104,7 +133,13 @@ internal sealed class ServerLease : IDisposable
             {
                 if (process.HasExited)
                     throw new InvalidOperationException($"The dsh process exited with code {process.ExitCode}.");
-                if (await IsReadyAsync(url)) return new ServerLease(process);
+                if (await IsReadyAsync(url))
+                {
+                    // Give the banner a short grace window; an older server
+                    // without it still opens on the configured URL.
+                    var banner = await Task.WhenAny(navigateUrl.Task, Task.Delay(TimeSpan.FromSeconds(3)));
+                    return new ServerLease(process, banner == navigateUrl.Task ? navigateUrl.Task.Result : null);
+                }
                 await Task.Delay(250);
             }
             throw new TimeoutException("The dsh Web server did not become ready within 30 seconds.");
@@ -121,12 +156,13 @@ internal sealed class ServerLease : IDisposable
         if (process is not null) Stop(process);
     }
 
+    /// <summary>Whether an HTTP server answers on the URL: any received status counts, including 401.</summary>
     private static async Task<bool> IsReadyAsync(Uri url)
     {
         try
         {
             using var response = await Http.GetAsync(url);
-            return response.IsSuccessStatusCode;
+            return true;
         }
         catch (HttpRequestException)
         {
