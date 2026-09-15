@@ -2,40 +2,59 @@
 .SYNOPSIS
     Hidden lifecycle manager for the DeepSeek Harness desktop shortcut.
 
-    .DESCRIPTION
-    Launched without a visible window by dsh-web.vbs. Starts the dsh web server
-    hidden (--no-open), waits for http://127.0.0.1:3080 to accept, installs and
-    opens the URL as an Edge Web App, waits for that window to close, then stops
-    the server. Closing the Edge window therefore stops dsh.
+.DESCRIPTION
+    Launched without a visible window by dsh-web.vbs. Prefers the published
+    WebView2 host; when that executable is missing it falls back to starting
+    the dsh web server hidden (--no-open), waiting for http://127.0.0.1:3080
+    to answer, and opening it as an Edge Web App. When that window closes the
+    server this launch spawned is stopped, so closing the window stops dsh.
 
-    If port 3080 is already serving (a previous dsh is running), no second
-    server is started: the script just opens the window, and when the window
-    closes it stops only the server this launch spawned — a pre-existing dsh
-    on port 3080 keeps running. That is the same ServerLease ownership the
-    WebView2 shell uses. Progress and errors append to the log at
-    $env:TEMP\dsh-web.log so a silent double-click failure can be diagnosed.
+    If port 3080 already serves a previous dsh, no second server is started:
+    the script only opens the window and stops nothing on exit — a pre-existing
+    dsh on port 3080 keeps running. That is the same ServerLease ownership the
+    WebView2 host uses.
+
+    Paths are resolved by scripts/dsh-shell-common.ps1: the dsh checkout comes
+    from $env:DSH_REPO_ROOT, then dsh-shell.config.json, then auto-detection of
+    sibling directories. Progress and errors append to $env:TEMP\dsh-web.log.
 #>
 
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = $PSScriptRoot
-$repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir '..\..'))
-$binJs = Join-Path $repoRoot 'apps\cli\lib\bin.js'
-$webViewShell = Join-Path $repoRoot 'native\webview2-shell\bin\Release\net8.0-windows\win-x64\publish\DeepSeek Harness.exe'
+. (Join-Path $scriptDir 'dsh-shell-common.ps1')
+
+$shellRoot = Get-ShellRoot -FromDirectory $scriptDir
 $url = 'http://127.0.0.1:3080'
-$logPath = Join-Path $env:TEMP 'dsh-web.log'
+$icoPath = Join-Path $shellRoot 'assets\favicon.ico'
 $edgeProfile = Join-Path $env:TEMP ('dsh-edge-' + [guid]::NewGuid().ToString('N'))
 $edgeShortcut = Join-Path $edgeProfile 'DeepSeek Harness.lnk'
 # Taskbar application identity: the Edge app window presents as its own
 # taskbar app (black-whale icon, pinnable) instead of an Edge window.
 $aumid = 'DeepSeekAI.DeepSeekHarness'
-$icoPath = Join-Path $scriptDir 'dsh-favicon.ico'
 
-function Write-Log {
-  param([string]$Message)
-  $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
-  Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8
+Write-ShellLog "start: shell=$shellRoot"
+
+$dshRepoRoot = Resolve-DshRepoRoot -ShellRoot $shellRoot
+if ($null -eq $dshRepoRoot) {
+  Write-ShellLog 'ERROR: could not locate the dsh checkout (apps/cli/lib/bin.js). Set $env:DSH_REPO_ROOT or dshRepoRoot in dsh-shell.config.json.'
+  exit 1
 }
+$binJs = Join-Path $dshRepoRoot 'apps\cli\lib\bin.js'
+Write-ShellLog "dsh checkout: $dshRepoRoot"
+
+# Prefer the native host once it has been published. It owns server startup,
+# the WebView2 window, and shutdown; the Edge path below remains a fallback
+# while the native host is not built on this checkout.
+$webViewShell = Get-WebView2ShellPath -ShellRoot $shellRoot
+if (Test-Path -LiteralPath $webViewShell) {
+  Write-ShellLog "starting WebView2 shell: $webViewShell"
+  $shellProcess = Start-Process -FilePath $webViewShell -ArgumentList $url -PassThru -Wait
+  Write-ShellLog "WebView2 shell exited with code $($shellProcess.ExitCode)"
+  exit $shellProcess.ExitCode
+}
+
+Write-ShellLog "WebView2 shell not published at $webViewShell; falling back to Edge app mode"
 
 function Find-EdgeExecutable {
   $roots = @(${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:LOCALAPPDATA)
@@ -54,16 +73,6 @@ function Get-PortOwnerPid {
   return $connection.OwningProcess
 }
 
-function Test-UrlReady {
-  try {
-    $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 2
-    return ($response.StatusCode -eq 200)
-  }
-  catch {
-    return $false
-  }
-}
-
 # Register the AUMID under HKCU so the Edge app window gets its own taskbar
 # identity: the black-whale icon and display name. Idempotent; a registration
 # failure (policy, permissions) only logs and never blocks the window.
@@ -77,10 +86,10 @@ function Register-TaskbarIdentity {
     Set-ItemProperty -Path $regPath -Name 'DisplayName' -Value 'DeepSeek Harness'
     Set-ItemProperty -Path $regPath -Name 'IconUri' -Value ([uri]$icoPath).AbsoluteUri
     Set-ItemProperty -Path $regPath -Name 'DefaultIcon' -Value $icoPath
-    Write-Log "taskbar identity registered: $aumid"
+    Write-ShellLog "taskbar identity registered: $aumid"
   }
   catch {
-    Write-Log "WARNING: taskbar identity registration failed: $($_.Exception.Message)"
+    Write-ShellLog "WARNING: taskbar identity registration failed: $($_.Exception.Message)"
   }
 }
 
@@ -89,9 +98,7 @@ function New-EdgeAppShortcut {
   $shell = New-Object -ComObject WScript.Shell
   $shortcut = $shell.CreateShortcut($Path)
   $shortcut.TargetPath = $edge
-  # --app keeps the launch in an independent app-mode window. The install-app
-  # switch opens a normal browser window on Edge versions that do not support
-  # silent installation for a local URL.
+  # --app keeps the launch in an independent app-mode window.
   $shortcut.Arguments = "--app=$url --user-data-dir=`"$edgeProfile`" --app-user-model-id=$aumid --no-first-run --no-default-browser-check --disable-extensions"
   $shortcut.WorkingDirectory = Split-Path -Parent $edge
   $shortcut.IconLocation = "$icoPath,0"
@@ -147,69 +154,45 @@ public static class TaskbarIcon {
   }
 }
 
-Write-Log "start: repo=$repoRoot"
-
-# Prefer the native host once it has been published. It owns server startup,
-# the WebView2 window, and shutdown; the Edge path below remains a fallback
-# while the native host is not built on this checkout.
-if (Test-Path -LiteralPath $webViewShell) {
-  Write-Log "starting WebView2 shell: $webViewShell"
-  $shellProcess = Start-Process -FilePath $webViewShell -ArgumentList $url -PassThru -Wait
-  Write-Log "WebView2 shell exited with code $($shellProcess.ExitCode)"
-  exit $shellProcess.ExitCode
-}
-
 $edge = Find-EdgeExecutable
 if ($null -eq $edge) {
-  Write-Log 'ERROR: Microsoft Edge not found; cannot open the app window.'
+  Write-ShellLog 'ERROR: Microsoft Edge not found; cannot open the app window.'
   exit 1
 }
 
 # --- Server lifecycle (ServerLease semantics) ------------------------------
 # Prefer the existing server on 3080 (a previous dsh is running). Otherwise
-# start a fresh hidden node server and wait for it to accept. Only a server
+# start a fresh hidden node server and wait for it to answer. Only a server
 # this launch spawned is stopped when the window closes; a pre-existing dsh
-# on 3080 keeps running, matching the WebView2 shell's ServerLease.
+# on 3080 keeps running, matching the WebView2 host's ServerLease.
 $existingPid = Get-PortOwnerPid -Port 3080
 $ownedPid = $null
 if ($null -ne $existingPid) {
-  Write-Log "port 3080 already served by PID $existingPid; reusing existing dsh"
+  Write-ShellLog "port 3080 already served by PID $existingPid; reusing existing dsh"
 }
 else {
-  Write-Log 'starting hidden node server'
+  Write-ShellLog "starting hidden node server: $binJs"
   $ownedProcess = Start-Process -FilePath 'node' `
     -ArgumentList @("$binJs", 'web', '--no-open') `
     -WindowStyle Hidden -PassThru
   $ownedPid = $ownedProcess.Id
-  Write-Log "node started PID=$ownedPid"
+  Write-ShellLog "node started PID=$ownedPid"
 
   $deadline = (Get-Date).AddSeconds(30)
-  while (-not (Test-UrlReady)) {
+  while (-not (Test-WebUrlReady -Url $url)) {
     if ((Get-Date) -gt $deadline) {
-      Write-Log 'ERROR: server did not become ready within 30s'
+      Write-ShellLog 'ERROR: server did not become ready within 30s'
       if ($null -ne $ownedPid) { Stop-Process -Id $ownedPid -Force -ErrorAction SilentlyContinue }
       exit 1
     }
     Start-Sleep -Milliseconds 500
   }
-  Write-Log 'server ready'
+  Write-ShellLog 'server ready'
 }
 
-# After readiness the port owner must exist. When we spawned it, $ownedPid
-# matches; a pre-existing server leaves $ownedPid null (never stop it).
-$targetPid = Get-PortOwnerPid -Port 3080
-if ($null -eq $targetPid) {
-  Write-Log 'ERROR: no process owns port 3080 after readiness; aborting'
-  if ($null -ne $ownedPid) { Stop-Process -Id $ownedPid -Force -ErrorAction SilentlyContinue }
-  exit 1
-}
-Write-Log "server owner PID=$targetPid; opening Edge app window"
 Register-TaskbarIdentity
 
 try {
-  # Independent msedge process with its own profile so WaitForExit observes the
-  # real window close instead of the request being handed to a running browser.
-  # --app-user-model-id presents the window as the DeepSeek Harness taskbar app.
   # Launch through a shortcut carrying the custom icon. Starting msedge.exe
   # directly makes the shell use Edge's executable icon for the taskbar button,
   # even when the app window has a custom AUMID.
@@ -217,13 +200,13 @@ try {
   New-EdgeAppShortcut -Path $edgeShortcut
   $edgeProc = Start-Process -FilePath $edgeShortcut -PassThru
   Set-EdgeWindowIcon -ProcessId $edgeProc.Id -IconPath $icoPath
-  Write-Log "edge window PID=$($edgeProc.Id); waiting for it to close"
+  Write-ShellLog "edge window PID=$($edgeProc.Id); waiting for it to close"
   $edgeProc.WaitForExit()
   if ($null -ne $ownedPid) {
-    Write-Log "edge window closed; stopping spawned dsh server PID=$ownedPid"
+    Write-ShellLog "edge window closed; stopping spawned dsh server PID=$ownedPid"
   }
   else {
-    Write-Log 'edge window closed; pre-existing dsh server on port 3080 keeps running'
+    Write-ShellLog 'edge window closed; pre-existing dsh server on port 3080 keeps running'
   }
 }
 finally {
@@ -232,5 +215,5 @@ finally {
     Stop-Process -Id $ownedPid -Force -ErrorAction SilentlyContinue
   }
   Remove-Item -LiteralPath $edgeProfile -Recurse -Force -ErrorAction SilentlyContinue
-  Write-Log 'done'
+  Write-ShellLog 'done'
 }
