@@ -23,6 +23,7 @@ $ErrorActionPreference = 'Stop'
 
 $scriptDir = $PSScriptRoot
 . (Join-Path $scriptDir 'dsh-shell-common.ps1')
+. (Join-Path $scriptDir 'sync-profile-links.ps1')
 
 $shellRoot = Get-ShellRoot -FromDirectory $scriptDir
 $url = 'http://127.0.0.1:3080'
@@ -42,6 +43,11 @@ if ($null -eq $dshRepoRoot) {
 }
 $binJs = Join-Path $dshRepoRoot 'apps\cli\lib\bin.js'
 Write-ShellLog "dsh checkout: $dshRepoRoot"
+
+# An upstream update may add packages to the web-app bundle without growing the
+# profile's junction list, leaving plugins stuck on a missing service. Repair
+# that before starting dsh; the scan is skipped unless the checkout changed.
+Sync-ProfileLinks -Apply -RemoveDangling
 
 # Prefer the native host once it has been published. It owns server startup,
 # the WebView2 window, and shutdown; the Edge path below remains a fallback
