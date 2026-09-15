@@ -113,7 +113,20 @@ function Sync-ProfileLinks {
     return
   }
 
-  $sourceDir = Join-Path $dshRoot 'apps\cli\node_modules\@deepseek-ai\dsh-web-app\node_modules\@deepseek-ai'
+  # Reach the bundle through its CANONICAL directory. Its node_modules entries
+  # are relative symlinks, and Windows resolves a relative target against the
+  # path as written: through the apps\cli junction they point at a directory
+  # that does not exist, while through the real directory they resolve.
+  $webAppPath = Join-Path $dshRoot 'apps\cli\node_modules\@deepseek-ai\dsh-web-app'
+  if (-not (Test-Path -LiteralPath $webAppPath)) {
+    Write-ShellLog "sync-profile-links: bundle package not found at $webAppPath; skipped"
+    return
+  }
+  $webAppReal = (Get-Item -LiteralPath $webAppPath -Force).Target
+  if ([string]::IsNullOrWhiteSpace($webAppReal) -or -not (Test-Path -LiteralPath $webAppReal)) {
+    $webAppReal = $webAppPath
+  }
+  $sourceDir = Join-Path $webAppReal 'node_modules\@deepseek-ai'
   if (-not (Test-Path -LiteralPath $sourceDir)) {
     Write-ShellLog "sync-profile-links: bundle directory not found at $sourceDir; skipped"
     return
@@ -132,11 +145,20 @@ function Sync-ProfileLinks {
     }
   }
 
-  $available = Get-ChildItem -LiteralPath $sourceDir -Directory -Force -ErrorAction SilentlyContinue |
-    Select-Object -ExpandProperty Name
-  if (-not $available -or $available.Count -eq 0) {
-    Write-ShellLog 'sync-profile-links: bundle directory is empty; skipped'
+  # Only entries that actually resolve to a package are usable; a broken
+  # relative link must never be propagated into the profile.
+  $available = @()
+  $unusable = @()
+  foreach ($item in (Get-ChildItem -LiteralPath $sourceDir -Directory -Force -ErrorAction SilentlyContinue)) {
+    if (Test-Path -LiteralPath (Join-Path $item.FullName 'package.json')) { $available += $item.Name }
+    else { $unusable += $item.Name }
+  }
+  if ($available.Count -eq 0) {
+    Write-ShellLog 'sync-profile-links: no usable bundle packages; skipped'
     return
+  }
+  foreach ($name in $unusable) {
+    Write-Host "sync-profile-links: unusable in bundle (not linked) $name"
   }
 
   if (-not (Test-Path -LiteralPath $linkDir)) {
@@ -166,6 +188,28 @@ function Sync-ProfileLinks {
     }
   }
 
+  # A link that exists but resolves to nothing must be rebuilt. This is the
+  # Windows relative-symlink trap: earlier runs linked through the apps\cli
+  # junction, where the bundle's relative targets point nowhere.
+  $repaired = 0
+  foreach ($item in (Get-ChildItem -LiteralPath $linkDir -Force -ErrorAction SilentlyContinue)) {
+    if ($available -notcontains $item.Name) { continue }
+    if (Test-Path -LiteralPath (Join-Path $item.FullName 'package.json')) { continue }
+    if (-not $Apply) {
+      Write-Host "sync-profile-links: would repair $($item.Name)"
+      continue
+    }
+    try {
+      [System.IO.Directory]::Delete($item.FullName, $false)
+      New-Item -ItemType Junction -Path $item.FullName -Target (Join-Path $sourceDir $item.Name) | Out-Null
+      $repaired++
+      Write-Host "sync-profile-links: repaired $($item.Name)"
+    }
+    catch {
+      Write-Host "sync-profile-links: cannot repair $($item.Name): $($_.Exception.Message)"
+    }
+  }
+
   # Pruning only happens once the checkout resolved above, so an unavailable
   # drive can never make every link look dangling and get deleted.
   $removed = 0
@@ -185,7 +229,7 @@ function Sync-ProfileLinks {
   }
 
   $verb = if ($Apply) { 'linked' } else { 'missing' }
-  Write-ShellLog "sync-profile-links: $verb $($missing.Count) of $($available.Count) packages; dangling=$($dangling.Count); removed=$removed"
+  Write-ShellLog "sync-profile-links: $verb $($missing.Count) of $($available.Count) packages; repaired=$repaired; dangling=$($dangling.Count); removed=$removed; unusable=$($unusable.Count)"
   if ($dangling.Count -gt 0) {
     Write-ShellLog "sync-profile-links: dangling: $($dangling -join ', ')"
   }
