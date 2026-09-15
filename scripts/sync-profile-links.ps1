@@ -113,22 +113,32 @@ function Sync-ProfileLinks {
     return
   }
 
-  # Reach the bundle through its CANONICAL directory. Its node_modules entries
-  # are relative symlinks, and Windows resolves a relative target against the
-  # path as written: through the apps\cli junction they point at a directory
-  # that does not exist, while through the real directory they resolve.
-  $webAppPath = Join-Path $dshRoot 'apps\cli\node_modules\@deepseek-ai\dsh-web-app'
-  if (-not (Test-Path -LiteralPath $webAppPath)) {
-    Write-ShellLog "sync-profile-links: bundle package not found at $webAppPath; skipped"
+  # Every bundle the profile loads contributes packages, so all of them are
+  # scanned: sourcing only packages\bundle\web-app misses what
+  # packages\bundle\base provides (dsh-storage-json, dsh-ptc-runtime-node) and
+  # leaves those packages unlinked, which cascades into whole services missing.
+  #
+  # Each bundle is reached through its CANONICAL directory. Its node_modules
+  # entries are relative symlinks, and Windows resolves a relative target
+  # against the path as written: through an apps\cli junction they point at a
+  # directory that does not exist, while through the real directory they resolve.
+  $bundleRoot = Join-Path $dshRoot 'packages\bundle'
+  if (-not (Test-Path -LiteralPath $bundleRoot)) {
+    Write-ShellLog "sync-profile-links: bundle root not found at $bundleRoot; skipped"
     return
   }
-  $webAppReal = (Get-Item -LiteralPath $webAppPath -Force).Target
-  if ([string]::IsNullOrWhiteSpace($webAppReal) -or -not (Test-Path -LiteralPath $webAppReal)) {
-    $webAppReal = $webAppPath
+  $sourceDirs = @()
+  foreach ($bundle in (Get-ChildItem -LiteralPath $bundleRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+    $bundleReal = $bundle.FullName
+    $linked = (Get-Item -LiteralPath $bundle.FullName -Force).Target
+    if ($linked -is [string] -and -not [string]::IsNullOrWhiteSpace($linked) -and (Test-Path -LiteralPath $linked)) {
+      $bundleReal = $linked
+    }
+    $candidate = Join-Path $bundleReal 'node_modules\@deepseek-ai'
+    if (Test-Path -LiteralPath $candidate) { $sourceDirs += $candidate }
   }
-  $sourceDir = Join-Path $webAppReal 'node_modules\@deepseek-ai'
-  if (-not (Test-Path -LiteralPath $sourceDir)) {
-    Write-ShellLog "sync-profile-links: bundle directory not found at $sourceDir; skipped"
+  if ($sourceDirs.Count -eq 0) {
+    Write-ShellLog "sync-profile-links: no bundle directories under $bundleRoot; skipped"
     return
   }
 
@@ -146,12 +156,20 @@ function Sync-ProfileLinks {
   }
 
   # Only entries that actually resolve to a package are usable; a broken
-  # relative link must never be propagated into the profile.
-  $available = @()
+  # relative link must never be propagated into the profile. The first bundle
+  # to provide a name wins.
+  $available = @{}
   $unusable = @()
-  foreach ($item in (Get-ChildItem -LiteralPath $sourceDir -Directory -Force -ErrorAction SilentlyContinue)) {
-    if (Test-Path -LiteralPath (Join-Path $item.FullName 'package.json')) { $available += $item.Name }
-    else { $unusable += $item.Name }
+  foreach ($dir in $sourceDirs) {
+    foreach ($item in (Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue)) {
+      if ($available.ContainsKey($item.Name)) { continue }
+      if (Test-Path -LiteralPath (Join-Path $item.FullName 'package.json')) {
+        $available[$item.Name] = $item.FullName
+      }
+      elseif ($unusable -notcontains $item.Name) {
+        $unusable += $item.Name
+      }
+    }
   }
   if ($available.Count -eq 0) {
     Write-ShellLog 'sync-profile-links: no usable bundle packages; skipped'
@@ -167,7 +185,7 @@ function Sync-ProfileLinks {
   }
 
   $existing = @(Get-ChildItem -LiteralPath $linkDir -Force -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
-  $missing = @($available | Where-Object { $existing -notcontains $_ })
+  $missing = @($available.Keys | Where-Object { $existing -notcontains $_ })
 
   # A link whose target has vanished (package removed or renamed upstream).
   $danglingItems = @(
@@ -177,7 +195,7 @@ function Sync-ProfileLinks {
   $dangling = @($danglingItems | Select-Object -ExpandProperty Name)
 
   foreach ($name in $missing) {
-    $target = Join-Path $sourceDir $name
+    $target = $available[$name]
     $link = Join-Path $linkDir $name
     if ($Apply) {
       New-Item -ItemType Junction -Path $link -Target $target | Out-Null
@@ -193,7 +211,7 @@ function Sync-ProfileLinks {
   # junction, where the bundle's relative targets point nowhere.
   $repaired = 0
   foreach ($item in (Get-ChildItem -LiteralPath $linkDir -Force -ErrorAction SilentlyContinue)) {
-    if ($available -notcontains $item.Name) { continue }
+    if (-not $available.ContainsKey($item.Name)) { continue }
     if (Test-Path -LiteralPath (Join-Path $item.FullName 'package.json')) { continue }
     if (-not $Apply) {
       Write-Host "sync-profile-links: would repair $($item.Name)"
@@ -201,7 +219,7 @@ function Sync-ProfileLinks {
     }
     try {
       [System.IO.Directory]::Delete($item.FullName, $false)
-      New-Item -ItemType Junction -Path $item.FullName -Target (Join-Path $sourceDir $item.Name) | Out-Null
+      New-Item -ItemType Junction -Path $item.FullName -Target $available[$item.Name] | Out-Null
       $repaired++
       Write-Host "sync-profile-links: repaired $($item.Name)"
     }
@@ -214,6 +232,13 @@ function Sync-ProfileLinks {
   # drive can never make every link look dangling and get deleted.
   $removed = 0
   foreach ($item in $danglingItems) {
+    # A package a bundle still provides is repaired above, never pruned.
+    # Pruning exactly this kind of link is what removed dsh-storage-json and
+    # took storageDomain, workspaceRegistry and the directory picker with it.
+    if ($available.ContainsKey($item.Name)) {
+      Write-Host "sync-profile-links: still provided by a bundle, not pruned $($item.Name)"
+      continue
+    }
     if ($Apply -and $RemoveDangling) {
       try {
         [System.IO.Directory]::Delete($item.FullName, $false)
