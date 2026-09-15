@@ -3,8 +3,10 @@ using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using Microsoft.Toolkit.Uwp.Notifications;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
+using Windows.UI.Notifications;
 
 namespace DeepSeekHarness.WebView2Shell;
 
@@ -53,6 +55,8 @@ internal sealed class ShellForm : Form
             await webView.EnsureCoreWebView2Async();
             webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
             webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
+            webView.CoreWebView2.PermissionRequested += OnPermissionRequested;
+            webView.CoreWebView2.NotificationReceived += OnNotificationReceived;
             webView.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
             // The spawned server prints its authenticated URL (bearer-token
             // fence); navigate there so the GUI actually loads. The configured
@@ -68,6 +72,82 @@ internal sealed class ShellForm : Form
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
             Close();
+        }
+    }
+
+    /// <summary>
+    /// Grant web notifications for the local DSH origin. WebView2's default
+    /// policy auto-denies every permission request, which silently breaks the
+    /// Notification API inside the shell; everything else keeps the default
+    /// deny, and only the loopback origin is ever allow-listed.
+    /// </summary>
+    private void OnPermissionRequested(object? sender, CoreWebView2PermissionRequestedEventArgs e)
+    {
+        try
+        {
+            var uri = new Uri(e.Uri);
+            var loopback = uri.Host is "127.0.0.1" or "localhost" or "[::1]"
+                && (uri.Scheme == "http" || uri.Scheme == "https");
+            if (loopback && e.PermissionKind == CoreWebView2PermissionKind.Notifications)
+            {
+                e.State = CoreWebView2PermissionState.Allow;
+                e.Handled = true;
+            }
+        }
+        catch
+        {
+            // Malformed URI: fall through to the default deny.
+        }
+    }
+
+    /// <summary>
+    /// Re-render web notifications as native app toasts. The default WebView2
+    /// UI attributes every banner to the page origin ("127.0.0.1:3080") and
+    /// follows the system banner duration; taking over lets the banner carry
+    /// the app name and a fixed 2-second lifetime.
+    /// </summary>
+    private void OnNotificationReceived(object? sender, CoreWebView2NotificationReceivedEventArgs e)
+    {
+        try
+        {
+            var uri = new Uri(e.SenderOrigin);
+            var loopback = uri.Host is "127.0.0.1" or "localhost" or "[::1]";
+            if (!loopback) return; // Non-loopback keeps the default (denied) UI path.
+
+            var notification = e.Notification;
+            var title = string.IsNullOrWhiteSpace(notification.Title) ? "DeepSeek Harness" : notification.Title;
+            var body = notification.Body ?? string.Empty;
+            e.Handled = true;
+            BeginInvoke(() => ShowToast(title, body));
+        }
+        catch
+        {
+            // Any failure falls back to WebView2's default notification UI.
+        }
+    }
+
+    /// <summary>Show one native toast attributed to the app; lifetime follows the system default (min ~5s).</summary>
+    private void ShowToast(string title, string body)
+    {
+        try
+        {
+            var builder = new ToastContentBuilder().AddText(title);
+            if (!string.IsNullOrWhiteSpace(body)) builder.AddText(body);
+            var toast = new ToastNotification(builder.GetToastContent().GetXml());
+            toast.Activated += (_, _) => BeginInvoke(() =>
+            {
+                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                Show();
+                Activate();
+            });
+
+            var notifier = ToastNotificationManagerCompat.CreateToastNotifier();
+            notifier.Show(toast);
+        }
+        catch
+        {
+            // Toast plumbing unavailable (missing Start Menu shortcut, etc.):
+            // silently skip; the next notification retries.
         }
     }
 
