@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Toolkit.Uwp.Notifications;
 using Microsoft.Web.WebView2.Core;
@@ -254,20 +255,89 @@ internal sealed class ServerLease : IDisposable
         }
     }
 
+    /// <summary>
+    /// Locates apps/cli/lib/bin.js. Roots are tried in order: DSH_REPO_ROOT,
+    /// dshRepoRoot in dsh-shell.config.json, sibling directories of this
+    /// checkout (auto-detection), then the app and working directories, each
+    /// walked upwards.
+    /// </summary>
     private static string FindDshBin()
     {
-        var roots = new[] { Environment.GetEnvironmentVariable("DSH_REPO_ROOT"), AppContext.BaseDirectory, Directory.GetCurrentDirectory() };
-        foreach (var root in roots.Where(value => !string.IsNullOrWhiteSpace(value)))
+        foreach (var root in CandidateRoots())
         {
-            var directory = new DirectoryInfo(root!);
+            if (string.IsNullOrWhiteSpace(root)) continue;
+            var directory = new DirectoryInfo(root);
             while (directory is not null)
             {
                 var candidate = Path.Combine(directory.FullName, "apps", "cli", "lib", "bin.js");
                 if (File.Exists(candidate)) return candidate;
-                directory = directory.Parent!;
+                directory = directory.Parent;
             }
         }
-        throw new FileNotFoundException("Could not locate apps/cli/lib/bin.js. Set DSH_REPO_ROOT to the checkout root.");
+        throw new FileNotFoundException(
+            "Could not locate apps/cli/lib/bin.js. Set DSH_REPO_ROOT, or dshRepoRoot in dsh-shell.config.json, to the dsh checkout root.");
+    }
+
+    private static IEnumerable<string?> CandidateRoots()
+    {
+        yield return Environment.GetEnvironmentVariable("DSH_REPO_ROOT");
+
+        var shellRoot = FindShellRoot();
+        if (shellRoot is not null)
+        {
+            yield return ReadConfigRoot(shellRoot);
+            foreach (var sibling in SiblingRoots(shellRoot)) yield return sibling;
+        }
+
+        yield return AppContext.BaseDirectory;
+        yield return Directory.GetCurrentDirectory();
+    }
+
+    /// <summary>Walks up for this shell's checkout root, marked by .git or dsh-shell.config.json.</summary>
+    private static string? FindShellRoot()
+    {
+        foreach (var start in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
+        {
+            var directory = new DirectoryInfo(start);
+            while (directory is not null)
+            {
+                var git = Path.Combine(directory.FullName, ".git");
+                var config = Path.Combine(directory.FullName, "dsh-shell.config.json");
+                if (Directory.Exists(git) || File.Exists(git) || File.Exists(config)) return directory.FullName;
+                directory = directory.Parent;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Reads dshRepoRoot from the machine-local dsh-shell.config.json (gitignored).</summary>
+    private static string? ReadConfigRoot(string shellRoot)
+    {
+        try
+        {
+            var path = Path.Combine(shellRoot, "dsh-shell.config.json");
+            if (!File.Exists(path)) return null;
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            return document.RootElement.TryGetProperty("dshRepoRoot", out var value) ? value.GetString() : null;
+        }
+        catch (Exception error)
+        {
+            Debug.WriteLine($"Could not read dsh-shell.config.json: {error.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>Sibling directories of this checkout, so a co-located dsh checkout is found automatically.</summary>
+    private static IEnumerable<string> SiblingRoots(string shellRoot)
+    {
+        var parent = Directory.GetParent(shellRoot);
+        if (parent is null) yield break;
+
+        foreach (var directory in parent.EnumerateDirectories())
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "apps", "cli", "lib", "bin.js")))
+                yield return directory.FullName;
+        }
     }
 
     private static string Quote(string value) => $"\"{value.Replace("\"", "\\\"")}\"";

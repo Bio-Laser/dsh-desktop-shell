@@ -1,0 +1,23 @@
+# Normalize line endings on checkin; let Git decide (text=auto).
+* text=auto
+
+# Windows scripts must stay CRLF in the working tree: cmd.exe and wscript.exe
+# are unreliable with LF-only batch/VBS files.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+*.vbs  text eol=crlf
+
+# Sources: keep LF in the repository, CRLF in the Windows working tree.
+*.cs      text eol=crlf
+*.csproj  text eol=crlf
+*.md      text eol=lf
+*.json    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+
+# Binaries must never be mangled by eol conversion.
+*.ico binary
+*.png binary
+*.dll binary
+*.exe binary

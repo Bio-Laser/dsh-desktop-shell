@@ -6,7 +6,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <ApplicationIcon>dsh-web.ico</ApplicationIcon>
+    <ApplicationIcon>..\assets\favicon.ico</ApplicationIcon>
     <AssemblyName>DeepSeek Harness</AssemblyName>
     <RootNamespace>DeepSeekHarness.WebView2Shell</RootNamespace>
     <PublishSingleFile>true</PublishSingleFile>
