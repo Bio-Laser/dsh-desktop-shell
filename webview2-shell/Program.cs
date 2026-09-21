@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using System.Net.Http;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -52,8 +52,15 @@ internal sealed class ShellForm : Form
     {
         try
         {
-            server = await ServerLease.StartAsync(new Uri(url));
-            await webView.EnsureCoreWebView2Async();
+            // The WebView2 runtime and the dsh server are independent: start
+            // both before awaiting either, so runtime initialization overlaps
+            // the server boot instead of following it.
+            var serverTask = ServerLease.StartAsync(new Uri(url));
+            var webViewTask = webView.EnsureCoreWebView2Async();
+            // Take the lease first: when WebView2 initialization fails, the
+            // FormClosed handler must still stop the server this shell spawned.
+            server = await serverTask;
+            await webViewTask;
             webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
             webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
             webView.CoreWebView2.PermissionRequested += OnPermissionRequested;
@@ -68,7 +75,7 @@ internal sealed class ShellForm : Form
         catch (Exception error)
         {
             MessageBox.Show(
-                $"DeepSeek Harness could not start its WebView2 runtime.\n\n{error.Message}",
+                $"DeepSeek Harness could not start.\n\n{error.Message}",
                 "DeepSeek Harness",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
@@ -162,7 +169,13 @@ internal sealed class ShellForm : Form
 /// <summary>Owns the dsh process started for one WebView2 window.</summary>
 internal sealed class ServerLease : IDisposable
 {
-    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(2) };
+    /// <summary>
+    /// Budget for one readiness connect. Deliberately short: loopback filter
+    /// drivers (Sangfor SSL VPN's TCP driver, Xunlei's WFP driver) can hold a
+    /// refused connect open for the OS SYN-retransmit window (~2s), which a
+    /// full-budget probe would add to every cold start.
+    /// </summary>
+    private static readonly TimeSpan ReadinessConnectTimeout = TimeSpan.FromMilliseconds(300);
 
     private readonly Process? process;
 
@@ -237,19 +250,26 @@ internal sealed class ServerLease : IDisposable
         if (process is not null) Stop(process);
     }
 
-    /// <summary>Whether an HTTP server answers on the URL: any received status counts, including 401.</summary>
+    /// <summary>
+    /// Whether a TCP listener accepts connections at the URL's host and port.
+    /// Connecting is enough: the bearer-token fence answering 401 still proves
+    /// the server is up.
+    /// </summary>
     private static async Task<bool> IsReadyAsync(Uri url)
     {
+        if (url.Port <= 0) return false;
+        using var client = new TcpClient();
+        using var timeout = new CancellationTokenSource(ReadinessConnectTimeout);
         try
         {
-            using var response = await Http.GetAsync(url);
+            await client.ConnectAsync(url.Host, url.Port, timeout.Token);
             return true;
         }
-        catch (HttpRequestException)
+        catch (OperationCanceledException)
         {
             return false;
         }
-        catch (TaskCanceledException)
+        catch (SocketException)
         {
             return false;
         }
